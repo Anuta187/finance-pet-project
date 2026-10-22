@@ -1,0 +1,26 @@
+# Node / фронтенд
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Maven / Java
+target/
+*.class
+.idea/
+*.iml
+.vscode/
+
+# База данных H2 (backend/data)
+backend/data/*
+!backend/data/.gitkeep
+*.mv.db
+*.trace.db
+
+# Allure
+allure-results/
+allure-report/
+autotests/.allure/
+autotests/build/
+
+.env
+.DS_Store

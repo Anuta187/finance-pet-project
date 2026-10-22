@@ -1,0 +1,58 @@
+server:
+  port: ${PORT:3000}
+
+spring:
+  application:
+    name: finance-backend
+  datasource:
+    # файл backend/data/finance.mv.db
+    url: jdbc:h2:file:${DB_PATH:./data/finance}
+    username: sa
+    password: ""
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate   # схему создаёт Flyway
+  flyway:
+    locations: classpath:db/migration
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+    deserialization:
+      use-big-decimal-for-floats: true   # суммы читаются без потерь float
+    generator:
+      write-bigdecimal-as-plain: true    # 100000, а не 1E+5
+
+app:
+  daily-limit-rub: 100000
+  seed:
+    enabled: ${SEED:true}
+    admin-password: ${ADMIN_PASSWORD:admin12345}
+    demo-password: ${DEMO_PASSWORD:demo12345}
+  jwt:
+    # в проде задать свой JWT_SECRET, не меньше 32 символов
+    secret: ${JWT_SECRET:local-dev-secret-change-me-0123456789abcdef}
+    ttl: ${JWT_TTL:PT24H}
+  autopayments:
+    scheduler-enabled: ${AUTOPAYMENTS_SCHEDULER:true}
+    cron: ${AUTOPAYMENTS_CRON:0 * * * * *}   # раз в минуту
+
+management:
+  endpoints:
+    web:
+      base-path: /api
+      exposure:
+        include: health
+      discovery:
+        enabled: false
+  endpoint:
+    health:
+      show-details: never
+
+springdoc:
+  api-docs:
+    path: /api/openapi-generated      # нужна для теста контракта
+  swagger-ui:
+    path: /api/docs
+    url: /api/openapi.yaml
+    disable-swagger-default-url: true

@@ -1,0 +1,17 @@
+{
+  "name": "finance-pet-project",
+  "version": "2.0.0",
+  "private": true,
+  "description": "«Личные финансы»: интернет-банк — системный анализ + QA-автоматизация (Spring Boot 3, Spring Security + JWT, React 18, JUnit 5, RestAssured, Selenide, Allure)",
+  "scripts": {
+    "setup": "npm install && npm --prefix frontend install",
+    "dev": "concurrently -k -n api,web -c blue,green \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "dev:test": "concurrently -k -n api,web -c blue,green \"npm run dev:backend:test\" \"npm run dev:frontend\"",
+    "dev:backend": "cd backend && mvn -q spring-boot:run",
+    "dev:backend:test": "cd backend && mvn -q spring-boot:run -Dspring-boot.run.profiles=test",
+    "dev:frontend": "npm --prefix frontend run dev"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.1"
+  }
+}

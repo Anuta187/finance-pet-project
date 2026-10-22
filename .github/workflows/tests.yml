@@ -1,0 +1,77 @@
+name: Tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: Backend + API + UI (Java)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Тесты бэкенда
+        run: mvn -B -f backend/pom.xml clean verify
+
+      - name: Сборка фронтенда
+        run: |
+          npm ci --prefix frontend
+          npm --prefix frontend run build
+
+      - name: Запуск бэкенда с профилем test
+        run: |
+          nohup java -jar backend/target/finance-backend.jar --spring.profiles.active=test > backend.log 2>&1 &
+          npx --yes wait-on@8 -t 120000 http-get://localhost:3000/api/health
+
+      - name: Запуск фронтенда
+        run: |
+          nohup npm --prefix frontend run dev > frontend.log 2>&1 &
+          npx --yes wait-on@8 -t 120000 http-get://localhost:5173
+
+      - name: Автотесты
+        run: mvn -B -f autotests/pom.xml clean test
+
+      - name: Сборка Allure-отчёта
+        if: ${{ !cancelled() }}
+        run: mvn -B -f autotests/pom.xml allure:report
+
+      - name: Загрузка Allure-отчёта
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: allure-report
+          path: |
+            autotests/target/allure-results/
+            autotests/target/site/allure-maven-plugin/
+          retention-days: 14
+
+      - name: Сборка Docker-образов
+        if: ${{ success() }}
+        run: docker compose build
+
+      - name: Логи приложения
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-logs
+          path: |
+            backend.log
+            frontend.log

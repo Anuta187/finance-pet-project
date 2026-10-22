@@ -1,0 +1,27 @@
+# docker compose up --build, потом открыть http://localhost:8080
+services:
+  backend:
+    build: ./backend
+    environment:
+      # не меньше 32 символов, для чего-то кроме локального запуска задайте свой
+      JWT_SECRET: ${JWT_SECRET:-docker-local-secret-change-me-0123456789abcdef}
+      TZ: Asia/Vladivostok
+    volumes:
+      - finance-data:/data
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    environment:
+      API_UPSTREAM: http://backend:3000
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "8080:80"
+    restart: unless-stopped
+
+volumes:
+  finance-data:

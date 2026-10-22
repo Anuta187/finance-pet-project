@@ -1,0 +1,759 @@
+openapi: 3.0.3
+info:
+  title: Личные финансы — REST API
+  version: 2.0.0
+  description: |
+    API учебного интернет-банка «Личные финансы»: регистрация и вход (JWT), счета, переводы между своими счетами,
+    карты, оплата услуг по категориям, автоплатежи, аналитика расходов и админ-панель.
+
+    **Аутентификация.** `POST /api/auth/login` или `/api/auth/register` возвращает JWT. Во все остальные запросы
+    передавайте заголовок `Authorization: Bearer <token>` (кнопка **Authorize** в Swagger UI). Токен живёт 24 часа.
+    Выход выполняется на клиенте удалением токена (stateless JWT).
+
+    **Роли.** `CLIENT` работает только со своими данными: чужие счета, карты и автоплатежи для него «не существуют»
+    (404). `ADMIN` дополнительно имеет доступ к `/api/admin/**`; клиенту там отвечают `403 FORBIDDEN`.
+    Заблокированный пользователь не может войти и выполнять запросы (`403 USER_BLOCKED`), даже со старым токеном.
+
+    **Бизнес-правила перевода**
+    - сумма > 0, не более 2 знаков после запятой;
+    - нельзя перевести больше остатка на счёте списания;
+    - дневной лимит переводов с одного счёта — 100 000 ₽ (календарные сутки по времени сервера);
+    - нельзя перевести на тот же счёт.
+
+    **Платежи и карты:** платёж идёт со счёта или по карте (ровно один источник); заблокированной или
+    просроченной картой платить нельзя (`CARD_BLOCKED`, `CARD_EXPIRED`).
+
+    Все ошибки возвращаются в едином формате `{ "error": { "code", "message", "details" } }`.
+
+    Контракт написан вручную (design-first). Реализация: Spring Boot 3, Spring Security, Java 17.
+servers:
+  - url: /
+tags:
+  - name: Auth
+    description: Регистрация, вход, текущий пользователь
+  - name: Accounts
+    description: Счета текущего пользователя
+  - name: Transfers
+    description: Переводы между своими счетами
+  - name: Operations
+    description: История операций
+  - name: Cards
+    description: Карты, привязанные к счетам
+  - name: Payments
+    description: Оплата услуг по категориям и аналитика расходов
+  - name: Autopayments
+    description: Регулярные платежи по расписанию
+  - name: Admin
+    description: Администрирование (только роль ADMIN)
+  - name: Service
+    description: Служебные эндпоинты
+security:
+  - bearerAuth: []
+paths:
+  /api/health:
+    get:
+      tags: [Service]
+      summary: Проверка работоспособности (Spring Boot Actuator)
+      security: []
+      responses:
+        '200':
+          description: Сервис работает
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: UP }
+
+  /api/auth/register:
+    post:
+      tags: [Auth]
+      summary: Регистрация клиента (возвращает JWT)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterRequest' }
+            example: { email: 'anna@example.com', password: 'Secret123', fullName: 'Анна Иванова' }
+      responses:
+        '201':
+          description: Пользователь создан с ролью CLIENT
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409':
+          description: Email уже зарегистрирован (EMAIL_TAKEN)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error: { code: EMAIL_TAKEN, message: 'Пользователь с таким email уже зарегистрирован' }
+  /api/auth/login:
+    post:
+      tags: [Auth]
+      summary: Вход по email и паролю (возвращает JWT)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+            example: { email: 'demo@finance.local', password: 'demo12345' }
+      responses:
+        '200':
+          description: Успешный вход
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: Неверный email или пароль (INVALID_CREDENTIALS)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error: { code: INVALID_CREDENTIALS, message: 'Неверный email или пароль' }
+        '403':
+          description: Пользователь заблокирован (USER_BLOCKED)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error: { code: USER_BLOCKED, message: 'Пользователь заблокирован. Обратитесь в поддержку банка' }
+  /api/auth/me:
+    get:
+      tags: [Auth]
+      summary: Текущий пользователь по токену
+      responses:
+        '200':
+          description: Профиль
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Blocked' }
+
+  /api/accounts:
+    get:
+      tags: [Accounts]
+      summary: Мои счета
+      responses:
+        '200':
+          description: Список счетов текущего пользователя
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Account' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Blocked' }
+    post:
+      tags: [Accounts]
+      summary: Открыть новый счёт
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateAccountRequest' }
+            example: { name: 'Отпуск', initialBalance: 1000 }
+      responses:
+        '201':
+          description: Счёт создан
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Account' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Blocked' }
+  /api/accounts/{id}:
+    get:
+      tags: [Accounts]
+      summary: Счёт по id (с информацией о дневном лимите)
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: Счёт
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccountDetails' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/transfers:
+    post:
+      tags: [Transfers]
+      summary: Перевод между своими счетами
+      description: Выполняется атомарно в одной транзакции БД. Оба счёта должны принадлежать текущему пользователю.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransferRequest' }
+            example: { fromAccountId: 1, toAccountId: 2, amount: 1500.5, comment: 'На отпуск' }
+      responses:
+        '201':
+          description: Перевод выполнен
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransferResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/BusinessRule' }
+
+  /api/operations:
+    get:
+      tags: [Operations]
+      summary: История моих операций (новые сверху)
+      parameters:
+        - name: accountId
+          in: query
+          required: false
+          description: Показать только операции, где счёт — отправитель или получатель
+          schema: { type: integer, minimum: 1 }
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Список операций
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Operation' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/cards:
+    get:
+      tags: [Cards]
+      summary: Мои карты
+      responses:
+        '200':
+          description: Карты текущего пользователя
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Card' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Cards]
+      summary: Выпустить виртуальную карту к счёту
+      description: Срок действия — 4 года. Полный номер не хранится и не возвращается, только маска.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/IssueCardRequest' }
+            example: { accountId: 1 }
+      responses:
+        '201':
+          description: Карта выпущена (статус ACTIVE)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Card' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/cards/{id}/block:
+    post:
+      tags: [Cards]
+      summary: Заблокировать карту
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: Карта заблокирована (статус BLOCKED)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Card' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/cards/{id}/unblock:
+    post:
+      tags: [Cards]
+      summary: Разблокировать карту
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: Карта активна (статус ACTIVE)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Card' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/categories:
+    get:
+      tags: [Payments]
+      summary: Справочник категорий расходов
+      responses:
+        '200':
+          description: Категории
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Category' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/payments:
+    post:
+      tags: [Payments]
+      summary: Оплата услуг по категории со счёта или по карте
+      description: |
+        Нужно указать ровно один источник: `accountId` или `cardId`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PaymentRequest' }
+            example: { categoryId: 1, cardId: 1, amount: 650, comment: 'Мобильная связь' }
+      responses:
+        '201':
+          description: Платёж проведён (операция PAYMENT)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaymentResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/BusinessRule' }
+  /api/stats/spending:
+    get:
+      tags: [Payments]
+      summary: Расходы по категориям за месяц
+      parameters:
+        - name: month
+          in: query
+          required: false
+          description: Месяц в формате ГГГГ-ММ, по умолчанию — текущий
+          schema: { type: string, example: '2026-10' }
+      responses:
+        '200':
+          description: Сумма и количество платежей по каждой категории, по убыванию суммы
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Spending' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/autopayments:
+    get:
+      tags: [Autopayments]
+      summary: Мои автоплатежи
+      responses:
+        '200':
+          description: Автоплатежи (новые сверху)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Autopayment' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Autopayments]
+      summary: Создать автоплатёж
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateAutopaymentRequest' }
+            example: { name: 'Мобильная связь', categoryId: 1, accountId: 1, amount: 650, period: MONTHLY, startDate: '2026-11-01' }
+      responses:
+        '201':
+          description: Автоплатёж создан (active = true, nextRunDate = startDate)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Autopayment' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/BusinessRule' }
+  /api/autopayments/{id}/disable:
+    post:
+      tags: [Autopayments]
+      summary: Отключить автоплатёж
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: Автоплатёж отключён (active = false), больше не исполняется
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Autopayment' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/admin/users:
+    get:
+      tags: [Admin]
+      summary: Все пользователи со сводкой по счетам
+      responses:
+        '200':
+          description: Пользователи
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/AdminUser' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/admin/users/{id}/block:
+    post:
+      tags: [Admin]
+      summary: Заблокировать пользователя
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: Пользователь заблокирован
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminUser' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422':
+          description: Администратора заблокировать нельзя (CANNOT_BLOCK_ADMIN)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /api/admin/users/{id}/unblock:
+    post:
+      tags: [Admin]
+      summary: Разблокировать пользователя
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: Пользователь разблокирован
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminUser' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/admin/operations:
+    get:
+      tags: [Admin]
+      summary: Все операции всех пользователей (новые сверху)
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Операции с владельцем (ownerId, ownerEmail)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Operation' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/admin/autopayments/run:
+    post:
+      tags: [Admin]
+      summary: Запустить автоплатежи, у которых наступила дата списания
+      description: |
+        То же, что делает плановое задание (@Scheduled, раз в минуту). Каждый автоплатёж обрабатывается
+        в отдельной транзакции; при ошибке (нет денег, карта заблокирована, клиент заблокирован)
+        фиксируется lastStatus = FAILED, и автоплатёж переносится на следующую дату.
+      responses:
+        '200':
+          description: Итог запуска
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AutopaymentRunResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer, minimum: 1 }
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+  schemas:
+    RegisterRequest:
+      type: object
+      required: [email, password, fullName]
+      properties:
+        email: { type: string, format: email, maxLength: 100 }
+        password: { type: string, minLength: 8, maxLength: 72, description: 'Хотя бы одна буква и одна цифра' }
+        fullName: { type: string, minLength: 2, maxLength: 100 }
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string }
+        password: { type: string }
+    User:
+      type: object
+      properties:
+        id: { type: integer }
+        email: { type: string }
+        fullName: { type: string }
+        role: { type: string, enum: [CLIENT, ADMIN] }
+        blocked: { type: boolean }
+        createdAt: { type: string, format: date-time }
+    AdminUser:
+      allOf:
+        - $ref: '#/components/schemas/User'
+        - type: object
+          properties:
+            accountsCount: { type: integer }
+            totalBalance: { type: number }
+    AuthResponse:
+      type: object
+      properties:
+        token: { type: string, description: JWT (HS256) }
+        tokenType: { type: string, example: Bearer }
+        expiresAt: { type: string, format: date-time }
+        user: { $ref: '#/components/schemas/User' }
+    Account:
+      type: object
+      required: [id, name, currency, balance, createdAt]
+      properties:
+        id: { type: integer, example: 1 }
+        name: { type: string, example: 'Основной' }
+        currency: { type: string, example: 'RUB' }
+        balance: { type: number, example: 50000 }
+        createdAt: { type: string, format: date-time }
+    AccountDetails:
+      allOf:
+        - $ref: '#/components/schemas/Account'
+        - type: object
+          properties:
+            dailyLimit: { type: number, example: 100000 }
+            dailyTransferred: { type: number, example: 2500 }
+            dailyLimitRemaining: { type: number, example: 97500 }
+    CreateAccountRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 50 }
+        initialBalance:
+          type: number
+          minimum: 0
+          description: Начальный остаток, ≥ 0, не более 2 знаков после запятой
+    TransferRequest:
+      type: object
+      required: [fromAccountId, toAccountId, amount]
+      properties:
+        fromAccountId: { type: integer, minimum: 1 }
+        toAccountId: { type: integer, minimum: 1 }
+        amount:
+          type: number
+          exclusiveMinimum: true
+          minimum: 0
+          description: Сумма > 0, не более 2 знаков после запятой
+        comment: { type: string, maxLength: 200 }
+    Operation:
+      type: object
+      properties:
+        id: { type: integer }
+        type: { type: string, enum: [OPENING, TRANSFER, PAYMENT] }
+        fromAccountId: { type: integer, nullable: true }
+        fromAccountName: { type: string, nullable: true }
+        toAccountId: { type: integer, nullable: true, description: 'NULL для PAYMENT' }
+        toAccountName: { type: string, nullable: true }
+        amount: { type: number }
+        comment: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+        categoryId: { type: integer, nullable: true }
+        categoryName: { type: string, nullable: true }
+        cardId: { type: integer, nullable: true }
+        cardMasked: { type: string, nullable: true, example: '2200 **** **** 1234' }
+        autopaymentId: { type: integer, nullable: true }
+        ownerId: { type: integer, description: 'Только в /api/admin/operations' }
+        ownerEmail: { type: string, description: 'Только в /api/admin/operations' }
+    TransferResult:
+      type: object
+      properties:
+        operation: { $ref: '#/components/schemas/Operation' }
+        fromAccount: { $ref: '#/components/schemas/Account' }
+        toAccount: { $ref: '#/components/schemas/Account' }
+    Card:
+      type: object
+      properties:
+        id: { type: integer }
+        accountId: { type: integer }
+        accountName: { type: string }
+        maskedNumber: { type: string, example: '2200 **** **** 1234' }
+        last4: { type: string, example: '1234' }
+        paymentSystem: { type: string, example: 'МИР' }
+        holderName: { type: string, example: 'IVAN PETROV' }
+        expiryMonth: { type: integer, example: 10 }
+        expiryYear: { type: integer, example: 2030 }
+        expiry: { type: string, example: '10/30' }
+        status: { type: string, enum: [ACTIVE, BLOCKED] }
+        createdAt: { type: string, format: date-time }
+    IssueCardRequest:
+      type: object
+      required: [accountId]
+      properties:
+        accountId: { type: integer, minimum: 1 }
+        holderName: { type: string, maxLength: 100, description: 'По умолчанию — ФИО владельца латиницей' }
+    Category:
+      type: object
+      properties:
+        id: { type: integer }
+        code: { type: string, example: MOBILE }
+        name: { type: string, example: 'Мобильная связь' }
+        color: { type: string, example: '#6366F1' }
+    PaymentRequest:
+      type: object
+      required: [categoryId, amount]
+      description: Ровно одно из полей accountId / cardId
+      properties:
+        categoryId: { type: integer, minimum: 1 }
+        accountId: { type: integer, minimum: 1 }
+        cardId: { type: integer, minimum: 1 }
+        amount: { type: number, description: 'Сумма > 0, не более 2 знаков после запятой' }
+        comment: { type: string, maxLength: 200 }
+    PaymentResult:
+      type: object
+      properties:
+        operation: { $ref: '#/components/schemas/Operation' }
+        account: { $ref: '#/components/schemas/Account' }
+    Spending:
+      type: object
+      properties:
+        month: { type: string, example: '2026-10' }
+        total: { type: number }
+        categories:
+          type: array
+          items:
+            type: object
+            properties:
+              categoryId: { type: integer }
+              code: { type: string }
+              name: { type: string }
+              color: { type: string }
+              amount: { type: number }
+              count: { type: integer }
+    CreateAutopaymentRequest:
+      type: object
+      required: [name, categoryId, amount, period]
+      description: Ровно одно из полей accountId / cardId
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+        categoryId: { type: integer, minimum: 1 }
+        accountId: { type: integer, minimum: 1 }
+        cardId: { type: integer, minimum: 1 }
+        amount: { type: number }
+        period: { type: string, enum: [DAILY, WEEKLY, MONTHLY] }
+        startDate: { type: string, format: date, description: 'Не раньше сегодняшнего дня; по умолчанию — сегодня' }
+    Autopayment:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        accountId: { type: integer }
+        accountName: { type: string }
+        cardId: { type: integer, nullable: true }
+        cardMasked: { type: string, nullable: true }
+        categoryId: { type: integer }
+        categoryName: { type: string }
+        amount: { type: number }
+        period: { type: string, enum: [DAILY, WEEKLY, MONTHLY] }
+        startDate: { type: string, format: date }
+        nextRunDate: { type: string, format: date }
+        active: { type: boolean }
+        lastRunAt: { type: string, format: date-time, nullable: true }
+        lastStatus: { type: string, enum: [SUCCESS, FAILED], nullable: true }
+        lastError: { type: string, nullable: true, example: 'INSUFFICIENT_FUNDS: Недостаточно средств на счёте списания' }
+        createdAt: { type: string, format: date-time }
+    AutopaymentRunResult:
+      type: object
+      properties:
+        date: { type: string, format: date }
+        processed: { type: integer }
+        succeeded: { type: integer }
+        failed: { type: integer }
+        results:
+          type: array
+          items:
+            type: object
+            properties:
+              autopaymentId: { type: integer }
+              status: { type: string, enum: [SUCCESS, FAILED] }
+              errorCode: { type: string, nullable: true }
+              operationId: { type: integer, nullable: true }
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum:
+                [VALIDATION_ERROR, INVALID_AMOUNT, INVALID_JSON, UNAUTHORIZED, INVALID_CREDENTIALS, FORBIDDEN,
+                 USER_BLOCKED, ACCOUNT_NOT_FOUND, CARD_NOT_FOUND, CATEGORY_NOT_FOUND, AUTOPAYMENT_NOT_FOUND,
+                 USER_NOT_FOUND, NOT_FOUND, EMAIL_TAKEN, SAME_ACCOUNT, INSUFFICIENT_FUNDS, DAILY_LIMIT_EXCEEDED,
+                 CARD_BLOCKED, CARD_EXPIRED, CANNOT_BLOCK_ADMIN, INTERNAL_ERROR]
+            message: { type: string }
+            details: { type: object, additionalProperties: true }
+  responses:
+    BadRequest:
+      description: Ошибка валидации (VALIDATION_ERROR, INVALID_AMOUNT, INVALID_JSON)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error: { code: INVALID_AMOUNT, message: 'Сумма должна быть больше 0', details: { field: amount } }
+    Unauthorized:
+      description: Нет токена, токен недействителен или истёк (UNAUTHORIZED)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error: { code: UNAUTHORIZED, message: 'Требуется авторизация' }
+    Forbidden:
+      description: Недостаточно прав — нужна роль ADMIN (FORBIDDEN)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error: { code: FORBIDDEN, message: 'Недостаточно прав для этого действия' }
+    Blocked:
+      description: Пользователь заблокирован (USER_BLOCKED)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error: { code: USER_BLOCKED, message: 'Пользователь заблокирован. Обратитесь в поддержку банка' }
+    NotFound:
+      description: Ресурс не найден или принадлежит другому пользователю (ACCOUNT_NOT_FOUND, CARD_NOT_FOUND, CATEGORY_NOT_FOUND, AUTOPAYMENT_NOT_FOUND, USER_NOT_FOUND)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error: { code: ACCOUNT_NOT_FOUND, message: 'Счёт с id=999 не найден', details: { accountId: 999 } }
+    BusinessRule:
+      description: Нарушено бизнес-правило (SAME_ACCOUNT, INSUFFICIENT_FUNDS, DAILY_LIMIT_EXCEEDED, CARD_BLOCKED, CARD_EXPIRED)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error: { code: CARD_BLOCKED, message: 'Карта •••• 1234 заблокирована' }
